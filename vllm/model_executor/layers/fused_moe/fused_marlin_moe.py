@@ -8,6 +8,10 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.activation import (
+    MoEActivation,
+    apply_moe_activation,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
@@ -23,10 +27,10 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
-    apply_moe_activation,
     disable_inplace,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    get_marlin_input_dtype,
     marlin_make_workspace_new,
     marlin_moe_intermediate_size,
     marlin_quant_input,
@@ -36,6 +40,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
+    kInt4Static,
+    kInt8Static,
+    kMxfp4Static,
+    kMxfp8Static,
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
@@ -59,9 +67,9 @@ def _fused_marlin_moe(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
-    activation: str = "silu",
+    activation: MoEActivation = MoEActivation.SILU,
     activation_func: Callable[
-        [str, torch.Tensor, torch.Tensor], None
+        [MoEActivation, torch.Tensor, torch.Tensor], None
     ] = apply_moe_activation,
     input_global_scale1: torch.Tensor | None = None,
     input_global_scale2: torch.Tensor | None = None,
@@ -83,7 +91,7 @@ def _fused_marlin_moe(
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
     N = marlin_moe_intermediate_size(w1, w2)
-    w13_num_shards = 1 if "no_mul" in activation else 2
+    w13_num_shards = 2 if activation.is_gated else 1
     if workspace is None:
         workspace = marlin_make_workspace_new(hidden_states.device, 4)
 
@@ -215,9 +223,9 @@ def fused_marlin_moe(
     quant_type_id: int,
     apply_router_weight_on_input: bool = False,
     global_num_experts: int = -1,
-    activation: str = "silu",
+    activation: MoEActivation = MoEActivation.SILU,
     activation_func: Callable[
-        [str, torch.Tensor, torch.Tensor], None
+        [MoEActivation, torch.Tensor, torch.Tensor], None
     ] = apply_moe_activation,
     moe_sum: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
     expert_map: torch.Tensor | None = None,
@@ -377,7 +385,7 @@ def batched_fused_marlin_moe(
     quant_type_id: int,
     apply_router_weight_on_input: bool = False,
     global_num_experts: int = -1,
-    activation: str | None = "silu",
+    activation: MoEActivation = MoEActivation.SILU,
     expert_map: torch.Tensor | None = None,
     global_scale1: torch.Tensor | None = None,
     global_scale2: torch.Tensor | None = None,
@@ -405,7 +413,7 @@ def batched_fused_marlin_moe(
     Note that the moe_align_block_size function indicates,
         - What rows of the A matrix (hidden_states) to access during the
         matmul, via sorted_ids output.
-        - What expert_id to use for each block matmul, via expert_ids ouptut.
+        - What expert_id to use for each block matmul, via expert_ids output.
 
     In the batched version, the tokens are already grouped/batched by experts
     they subscribe to. Due to this, we can represent the batched hidden_states
@@ -522,7 +530,7 @@ def batched_fused_marlin_moe(
     return output
 
 
-class MarlinExpertsBase(mk.FusedMoEPermuteExpertsUnpermute):
+class MarlinExpertsBase(mk.FusedMoEExpertsModular):
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -547,6 +555,8 @@ class MarlinExpertsBase(mk.FusedMoEPermuteExpertsUnpermute):
         self.w13_g_idx_sort_indices = w13_g_idx_sort_indices
         self.w2_g_idx_sort_indices = w2_g_idx_sort_indices
         self.is_k_full = is_k_full
+        self.input_dtype = get_marlin_input_dtype()
+
         super().__init__(
             moe_config=moe_config,
             quant_config=quant_config,
@@ -568,34 +578,43 @@ class MarlinExpertsBase(mk.FusedMoEPermuteExpertsUnpermute):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        # TODO(rob): add int4, mxfp4, int8 as integrations
+        # TODO(rob): add int4, int8 as integrations
         # are migrated to use the oracle one-by-one.
         SUPPORTED_W = [
             kFp8Static128BlockSym,
             kFp8StaticChannelSym,
             kFp8StaticTensorSym,
+            kMxfp4Static,
+            kMxfp8Static,
             kNvfp4Static,
+            kInt4Static,
+            kInt8Static,
         ]
         return weight_key in SUPPORTED_W
 
     @staticmethod
-    def _supports_activation(activation: str) -> bool:
+    def _supports_activation(activation: MoEActivation) -> bool:
+        # Marlin uses apply_moe_activation() callback for activation,
+        # so any activation supported there can be used here.
         return activation in [
-            "silu",
-            "gelu",
-            "swigluoai",
-            "silu_no_mul",
-            "gelu_no_mul",
-            "relu2_no_mul",
+            MoEActivation.SILU,
+            MoEActivation.GELU,
+            MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUSTEP,
+            MoEActivation.SILU_NO_MUL,
+            MoEActivation.GELU_NO_MUL,
+            MoEActivation.RELU2_NO_MUL,
         ]
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        return not moe_parallel_config.use_fi_all2allv_kernels
+        return not (
+            moe_parallel_config.use_fi_nvl_two_sided_kernels
+            or moe_parallel_config.use_fi_nvl_one_sided_kernels
+        )
 
     @property
     def quant_type_id(self) -> int:
-        # uint4b8 will be set for int4 weight and float4_e2m1f will be used for mxfp4
         if self.quant_config.use_int4_w4a16:
             return scalar_types.uint4b8.id
         elif self.quant_config.use_mxfp4_w4a16 or self.quant_config.use_nvfp4_w4a16:
@@ -649,9 +668,6 @@ class MarlinExperts(MarlinExpertsBase):
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
 
-    def supports_chunking(self) -> bool:
-        return True
-
     def workspace_shapes(
         self,
         M: int,
@@ -661,7 +677,7 @@ class MarlinExperts(MarlinExpertsBase):
         global_num_experts: int,
         local_num_experts: int,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
-        activation: str,
+        activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         # Modular Kernel provisions output buffer from workspace1. However in
         # the fused_marlin_moe() function, the final torch.sum(), is defined
@@ -692,7 +708,7 @@ class MarlinExperts(MarlinExpertsBase):
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        activation: str,
+        activation: MoEActivation,
         global_num_experts: int,
         expert_map: torch.Tensor | None,
         a1q_scale: torch.Tensor | None,
@@ -704,7 +720,7 @@ class MarlinExperts(MarlinExpertsBase):
     ):
         assert self.w1_scale is not None
         assert self.w2_scale is not None
-        return fused_marlin_moe(
+        fused_marlin_moe(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -733,6 +749,7 @@ class MarlinExperts(MarlinExpertsBase):
             sort_indices1=self.w13_g_idx_sort_indices,
             sort_indices2=self.w2_g_idx_sort_indices,
             is_k_full=self.is_k_full,
+            input_dtype=self.input_dtype,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
@@ -776,9 +793,6 @@ class BatchedMarlinExperts(MarlinExpertsBase):
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.BatchedExperts
 
-    def supports_chunking(self) -> bool:
-        return False
-
     def workspace_shapes(
         self,
         M: int,
@@ -788,7 +802,7 @@ class BatchedMarlinExperts(MarlinExpertsBase):
         global_num_experts: int,
         local_num_experts: int,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
-        activation: str,
+        activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         assert self.num_dispatchers is not None
         assert self.max_num_tokens is not None
@@ -808,7 +822,7 @@ class BatchedMarlinExperts(MarlinExpertsBase):
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        activation: str,
+        activation: MoEActivation,
         global_num_experts: int,
         expert_map: torch.Tensor | None,
         a1q_scale: torch.Tensor | None,
